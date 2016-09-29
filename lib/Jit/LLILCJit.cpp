@@ -29,6 +29,7 @@
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFFormValue.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/ObjectTransformLayer.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/Support/DataTypes.h"
@@ -58,6 +59,9 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include <string>
+#if defined(WIN32) && defined(_MSC_VER)
+#include <crtdbg.h>
+#endif
 
 using namespace llvm;
 using namespace llvm::object;
@@ -73,7 +77,7 @@ public:
 
     for (const auto &PObj : Objs) {
 
-      const object::ObjectFile &Obj = *PObj;
+      const object::ObjectFile &Obj = *PObj->getBinary();
       const RuntimeDyld::LoadedObjectInfo &L = *LoadedObjInfos[I];
 
       getDebugInfoForObject(Obj, L);
@@ -144,6 +148,7 @@ private:
 
 // The one and only Jit Object.
 LLILCJit *LLILCJit::TheJit = nullptr;
+ICorJitHost *LLILCJit::TheJitHost = nullptr;
 
 // This is guaranteed to be called by the EE
 // in single-threaded mode.
@@ -161,6 +166,27 @@ ICorJitCompiler *__stdcall getJit() {
 
     // Allow LLVM to pick up options via the environment
     cl::ParseEnvironmentOptions("LLILCJit", "COMPlus_AltJitOptions");
+
+#if defined(_WIN32) && defined(_MSC_VER)
+    // Conditionally suppress error dialogs to avoid hangs on lab machines.
+    // Leave policy on crash reporting and postmortem to our host.
+    //
+    // Would be nice to query options here, but we don't have a callback pointer
+    // until we get the first jit request. For now we just look at the
+    // environment variable.
+    const char *NoPopups = getenv("COMPlus_NoGuiOnAssert");
+    if ((NoPopups != nullptr) && (NoPopups[0] != '0')) {
+      const bool NoCrashReporting = true;
+      llvm::sys::PrintStackTraceOnErrorSignal(NoCrashReporting);
+      ::_set_error_mode(_OUT_TO_STDERR);
+      _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+      _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+      _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+      _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+      _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+      _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    }
+#endif
 
     auto &Opts = cl::getRegisteredOptions();
     if (Opts["fast-isel"]->getNumOccurrences() == 0) {
@@ -209,6 +235,10 @@ BOOL WINAPI DllMain(HANDLE Instance, DWORD Reason, LPVOID Reserved) {
 
 extern "C" void __stdcall sxsJitStartup(void *CcCallbacks) {
   // nothing to do
+}
+
+extern "C" void __stdcall jitStartup(ICorJitHost *JitHost) {
+  LLILCJit::TheJitHost = JitHost;
 }
 
 LLILCJitContext::LLILCJitContext(LLILCJitPerThreadState *PerThreadState)
@@ -322,10 +352,11 @@ CorJitResult LLILCJit::compileMethod(ICorJitInfo *JitInfo,
     EEMemoryManager MM(&Context);
     ObjectLoadListener Listener(&Context);
     orc::EEObjectLinkingLayer<decltype(Listener)> Loader(Listener);
-    auto ReserveUnwindSpace = [&MM](std::unique_ptr<object::ObjectFile> Obj) {
-      MM.reserveUnwindSpace(*Obj);
-      return std::move(Obj);
-    };
+    auto ReserveUnwindSpace =
+        [&MM](std::unique_ptr<object::OwningBinary<object::ObjectFile>> Obj) {
+          MM.reserveUnwindSpace(*Obj->getBinary());
+          return std::move(Obj);
+        };
     orc::ObjectTransformLayer<decltype(Loader), decltype(ReserveUnwindSpace)>
         UnwindReserver(Loader, ReserveUnwindSpace);
     orc::IRCompileLayer<decltype(UnwindReserver)> Compiler(
@@ -336,7 +367,8 @@ CorJitResult LLILCJit::compileMethod(ICorJitInfo *JitInfo,
       dbgs() << "INFO:  jitting method " << Context.MethodName
              << " using LLILCJit\n";
     }
-    bool HasMethod = this->readMethod(&Context);
+    bool ContainsUnmanagedCall;
+    bool HasMethod = this->readMethod(&Context, ContainsUnmanagedCall);
 
 #ifndef FEATURE_VERIFICATION
     bool IsImportOnly = (Context.Flags & CORJIT_FLG_IMPORT_ONLY) != 0;
@@ -359,11 +391,16 @@ CorJitResult LLILCJit::compileMethod(ICorJitInfo *JitInfo,
                << "\n";
         Context.CurrentModule->dump();
       }
-      if (Context.Options->DoInsertStatepoints) {
-        // If using Precise GC, run the GC-Safepoint insertion
-        // and lowering passes before generating code.
+      // If using Precise GC, run the GC-Safepoint insertion
+      // and lowering passes before generating code.  If
+      // using conservative GC but the function has an unmanaged
+      // call, skip safepoint insertion but run the lowering
+      // pass to lower the gc-transition arguments.
+      if (ContainsUnmanagedCall || Context.Options->DoInsertStatepoints) {
         legacy::PassManager Passes;
-        Passes.add(createPlaceSafepointsPass());
+        if (Context.Options->DoInsertStatepoints) {
+          Passes.add(createPlaceSafepointsPass());
+        }
         Passes.add(createRewriteStatepointsForGCPass());
         Passes.run(*M);
       }
@@ -476,7 +513,8 @@ LLILCJitContext::getModuleForMethod(CORINFO_METHOD_INFO *MethodInfo) {
 }
 
 // Read method MSIL and construct LLVM bitcode
-bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
+bool LLILCJit::readMethod(LLILCJitContext *JitContext,
+                          bool &ContainsUnmanagedCall) {
   if (JitContext->HasLoadedBitCode) {
     // This is a case where we side loaded a llvm bitcode module.
     // The module is already complete so we avoid reading entirely.
@@ -489,6 +527,7 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
   try {
     GenIR Reader(JitContext);
     Reader.msilToIR();
+    ContainsUnmanagedCall = Reader.containsUnmanagedCall();
   } catch (NotYetImplementedException &Nyi) {
     if (DumpLevel >= ::DumpLevel::SUMMARY) {
       errs() << "Failed to read " << FuncName << '[' << Nyi.reason() << "]\n";

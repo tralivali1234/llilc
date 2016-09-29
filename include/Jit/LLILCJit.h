@@ -74,6 +74,7 @@ public:
   /// \name CoreCLR EE information
   //@{
   ICorJitInfo *JitInfo;            ///< EE callback interface.
+  ICorJitHost *JitHost;            ///< EE Host Interface
   CORINFO_METHOD_INFO *MethodInfo; ///< Description of method to jit.
   uint32_t Flags;                  ///< Flags controlling jit behavior.
   CORINFO_EE_INFO EEInfo;          ///< Information about internal EE data.
@@ -159,7 +160,8 @@ public:
   /// are looked up via element type, element handle, array rank, and whether
   /// this array is a vector (single-dimensional array with zero lower bound).
   std::map<std::tuple<CorInfoType, CORINFO_CLASS_HANDLE, uint32_t, bool>,
-           llvm::Type *> ArrayTypeMap;
+           llvm::Type *>
+      ArrayTypeMap;
 
   /// \brief Map from a field handle to the index of that field in the overall
   /// layout of the enclosing class.
@@ -182,7 +184,6 @@ public:
     // Address UINT64_MAX means that we will resolve relocations for this symbol
     // manually and the dynamic linker will skip relocation resolution for this
     // symbol.
-    assert(NameToHandleMap->count(Name) == 1);
     return llvm::RuntimeDyld::SymbolInfo(UINT64_MAX,
                                          llvm::JITSymbolFlags::None);
   }
@@ -272,12 +273,17 @@ public:
 private:
   /// Convert a method into LLVM IR.
   /// \param JitContext Context record for the method's jit request.
+  /// \param ContainsUnmanagedCall [out] Indicates whether the method read
+  ///                                    contains a call to unmanaged code.
   /// \returns \p true if the conversion was successful.
-  bool readMethod(LLILCJitContext *JitContext);
+  bool readMethod(LLILCJitContext *JitContext, bool &ContainsUnmanagedCall);
 
 public:
   /// A pointer to the singleton jit instance.
   static LLILCJit *TheJit;
+
+  /// A pointer to the singleton jit-host instance.
+  static ICorJitHost *TheJitHost;
 
 private:
   /// Thread local storage for the jit's per-thread state.

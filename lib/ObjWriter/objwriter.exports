@@ -6,7 +6,14 @@ EmitBlob
 EmitIntValue
 EmitSymbolDef
 EmitSymbolRef
-EmitFrameInfo
+EmitWinFrameInfo
+EmitCFIStart
+EmitCFIEnd
+EmitCFICode
+EmitCFILsda
 EmitDebugFileInfo
 EmitDebugLoc
-FlushDebugLocs
+EmitDebugFunctionInfo
+EmitDebugModuleInfo
+EmitDebugVar
+CreateCustomSection

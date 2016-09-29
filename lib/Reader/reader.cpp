@@ -2205,11 +2205,7 @@ EHRegion *ReaderBase::fgSwitchRegion(EHRegion *OldRegion, uint32_t Offset,
     // Exit this region; recursively check parent (may need to exit to ancestor
     // and/or may need to enter sibling/cousin).
     assert(Offset == TransitionOffset && "over-stepped region end");
-    EHRegion *ParentRegion = rgnGetParent(OldRegion);
-    if (rgnIsOutsideParent(OldRegion)) {
-      // We want the enclosing ancestor, not the immediate parent.
-      ParentRegion = rgnGetParent(ParentRegion);
-    }
+    EHRegion *ParentRegion = rgnGetEnclosingAncestor(OldRegion);
     return fgSwitchRegion(ParentRegion, Offset, NextOffset);
   }
 
@@ -2280,12 +2276,6 @@ EHRegion *ReaderBase::fgSwitchRegion(EHRegion *OldRegion, uint32_t Offset,
   *NextOffset = TransitionOffset;
   return OldRegion;
 }
-
-#define CHECKTARGET(TargetOffset, BufSize)                                     \
-  {                                                                            \
-    if ((TargetOffset) < 0 || (TargetOffset) >= (BufSize))                     \
-      ReaderBase::verGlobalError(MVER_E_BAD_BRANCH);                           \
-  }
 
 // Parse bytecode to blocks.  Incoming argument 'block' holds dummy
 // entry block. This entry block may be preceeded by another block
@@ -2414,7 +2404,10 @@ void ReaderBase::fgBuildPhase1(FlowGraphNode *Block, uint8_t *ILInput,
 
       // Make the label node
       TargetOffset = NextOffset + BranchOffset;
-      CHECKTARGET(TargetOffset, ILInputSize);
+
+      // Check target size
+      if (TargetOffset >= ILInputSize)
+        ReaderBase::verGlobalError(MVER_E_BAD_BRANCH);
 
       if (Opcode == ReaderBaseNS::CEE_LEAVE ||
           Opcode == ReaderBaseNS::CEE_LEAVE_S) {
@@ -2460,7 +2453,11 @@ void ReaderBase::fgBuildPhase1(FlowGraphNode *Block, uint8_t *ILInput,
       // Make the short-circuit target label
       BlockNode = fgNodeGetStartIRNode(Block);
       GraphNode = nullptr;
-      CHECKTARGET(NextOffset, ILInputSize);
+
+      // Check target size
+      if (NextOffset >= ILInputSize)
+        ReaderBase::verGlobalError(MVER_E_BAD_BRANCH);
+
       fgAddNodeMSILOffset(&GraphNode, NextOffset);
 
       // Make the switch node.
@@ -2474,7 +2471,10 @@ void ReaderBase::fgBuildPhase1(FlowGraphNode *Block, uint8_t *ILInput,
       for (uint32_t I = 0; (uint32_t)I < NumCases; I++) {
         BranchOffset = readSwitchCase(&Operand);
         TargetOffset = NextOffset + BranchOffset;
-        CHECKTARGET(TargetOffset, ILInputSize);
+
+        // Check target size
+        if (TargetOffset >= ILInputSize)
+          ReaderBase::verGlobalError(MVER_E_BAD_BRANCH);
 
         GraphNode = nullptr;
         fgAddNodeMSILOffset(&GraphNode, TargetOffset);
@@ -4917,10 +4917,12 @@ IRNode *ReaderBase::rdrGetDirectCallTarget(CORINFO_METHOD_HANDLE Method,
     Address = CodePointerLookup.constLookup.addr;
     assert(Address != nullptr);
   } else {
+    // Ask for the generic "ANY" entry point. If NeedsNullCheck is true,
+    // we could instead ask for the CORINFO_ACCESS_NONNULL entry,
+    // but then we'd have to generalize the key used to look things
+    // up in the HandleToGlobalObjectMap.
     CORINFO_CONST_LOOKUP AddressInfo;
-    getFunctionEntryPoint(Method, &AddressInfo, NeedsNullCheck
-                                                    ? CORINFO_ACCESS_NONNULL
-                                                    : CORINFO_ACCESS_ANY);
+    getFunctionEntryPoint(Method, &AddressInfo, CORINFO_ACCESS_ANY);
     AccessType = AddressInfo.accessType;
     Address = AddressInfo.addr;
   }

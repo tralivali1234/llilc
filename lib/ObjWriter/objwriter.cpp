@@ -14,18 +14,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/AsmPrinter.h"
+#include "llvm/DebugInfo/CodeView/CodeView.h"
+#include "llvm/DebugInfo/CodeView/Line.h"
+#include "llvm/DebugInfo/CodeView/SymbolRecord.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCParser/AsmLexer.h"
 #include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSectionCOFF.h"
+#include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionMachO.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
-#include "llvm/MC/MCTargetAsmParser.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
 #include "llvm/MC/MCTargetOptionsCommandFlags.h"
 #include "llvm/MC/MCWinCOFFStreamer.h"
 #include "llvm/Support/COFF.h"
@@ -37,16 +43,20 @@
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/PrettyStackTrace.h"
-#include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/Win64EH.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
+#include "cfi.h"
+#include <string>
+#include "jitDebugInfo.h"
 
 using namespace llvm;
+using namespace llvm::codeview;
 
 static cl::opt<std::string>
     ArchName("arch", cl::desc("Target arch to assemble for, "
@@ -115,13 +125,6 @@ bool error(const Twine &Error) {
   return false;
 }
 
-typedef struct _DebugLocInfo {
-  int NativeOffset;
-  int FileId;
-  int LineNumber;
-  int ColNumber;
-} DebugLocInfo;
-
 class ObjectWriter {
 public:
   std::unique_ptr<MCRegisterInfo> MRI;
@@ -140,7 +143,12 @@ public:
 
   std::unique_ptr<raw_fd_ostream> OS;
   MCTargetOptions MCOptions;
-  std::vector<DebugLocInfo> DebugLocInfos;
+  bool FrameOpened;
+  std::vector<DebugVarInfo> DebugVarInfos;
+
+  std::map<std::string, MCSection *> CustomSections;
+  std::set<MCSection *> Sections;
+  int FuncId;
 
 public:
   bool init(StringRef FunctionName);
@@ -151,8 +159,6 @@ public:
 };
 
 bool ObjectWriter::init(llvm::StringRef ObjectFilePath) {
-  // Print a stack trace if we signal out.
-  sys::PrintStackTraceOnErrorSignal();
   llvm_shutdown_obj Y; // Call llvm_shutdown() on exit.
 
   // Initialize targets
@@ -207,6 +213,7 @@ bool ObjectWriter::init(llvm::StringRef ObjectFilePath) {
 
   MS = TheTarget->createMCObjectStreamer(TheTriple, *MC, *MAB, *OS, MCE, *MSTI,
                                          RelaxAll,
+                                         /*IncrementalLinkerCompatible*/ true,
                                          /*DWARFMustBeAtTheEnd*/ false);
   if (!MS)
     return error("no object streamer for target " + TripleName);
@@ -219,6 +226,9 @@ bool ObjectWriter::init(llvm::StringRef ObjectFilePath) {
   Asm.reset(TheTarget->createAsmPrinter(*TM, std::unique_ptr<MCStreamer>(MS)));
   if (!Asm)
     return error("no asm printer for target " + TripleName);
+
+  FrameOpened = false;
+  FuncId = 1;
 
   return true;
 }
@@ -243,6 +253,91 @@ extern "C" void FinishObjWriter(ObjectWriter *OW) {
   delete OW;
 }
 
+enum CustomSectionAttributes : int32_t {
+  CustomSectionAttributes_ReadOnly = 0x0000,
+  CustomSectionAttributes_Writeable = 0x0001,
+  CustomSectionAttributes_Executable = 0x0002,
+  CustomSectionAttributes_MachO_Init_Func_Pointers = 0x0100,
+};
+
+extern "C" bool CreateCustomSection(ObjectWriter *OW, const char *SectionName,
+                                    CustomSectionAttributes attributes,
+                                    const char *ComdatName) {
+  assert(OW && "ObjWriter is null");
+  Triple TheTriple(TripleName);
+  auto *AsmPrinter = &OW->getAsmPrinter();
+  auto &OST = *AsmPrinter->OutStreamer;
+  MCContext &OutContext = OST.getContext();
+
+  std::string SectionNameStr(SectionName);
+  assert(OW->CustomSections.find(SectionNameStr) == OW->CustomSections.end() &&
+         "Section with duplicate name already exists");
+  assert(ComdatName == nullptr ||
+         OW->MOFI->getObjectFileType() == OW->MOFI->IsCOFF);
+
+  MCSection *Section = nullptr;
+  SectionKind Kind = (attributes & CustomSectionAttributes_Executable)
+                         ? SectionKind::getText()
+                         : (attributes & CustomSectionAttributes_Writeable)
+                               ? SectionKind::getData()
+                               : SectionKind::getReadOnly();
+
+  switch (TheTriple.getObjectFormat()) {
+  case Triple::MachO: {
+    unsigned typeAndAttributes = 0;
+    if (attributes & CustomSectionAttributes_MachO_Init_Func_Pointers) {
+      typeAndAttributes |= MachO::SectionType::S_MOD_INIT_FUNC_POINTERS;
+    }
+    Section = OutContext.getMachOSection(
+        (attributes & CustomSectionAttributes_Executable) ? "__TEXT" : "__DATA",
+        SectionName, typeAndAttributes, Kind);
+    break;
+  }
+  case Triple::COFF: {
+    unsigned Characteristics = COFF::IMAGE_SCN_MEM_READ;
+
+    if (attributes & CustomSectionAttributes_Executable) {
+      Characteristics |= COFF::IMAGE_SCN_CNT_CODE | COFF::IMAGE_SCN_MEM_EXECUTE;
+    } else if (attributes & CustomSectionAttributes_Writeable) {
+      Characteristics |=
+          COFF::IMAGE_SCN_CNT_INITIALIZED_DATA | COFF::IMAGE_SCN_MEM_WRITE;
+    } else {
+      Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
+    }
+
+    if (ComdatName != nullptr) {
+      Section = OutContext.getCOFFSection(
+          SectionName, Characteristics | COFF::IMAGE_SCN_LNK_COMDAT, Kind,
+          ComdatName, COFF::COMDATType::IMAGE_COMDAT_SELECT_ANY);
+    } else {
+      Section = OutContext.getCOFFSection(SectionName, Characteristics, Kind);
+    }
+    break;
+  }
+  case Triple::ELF: {
+    unsigned Flags = ELF::SHF_ALLOC;
+    if (attributes & CustomSectionAttributes_Executable) {
+      Flags |= ELF::SHF_EXECINSTR;
+    } else if (attributes & CustomSectionAttributes_Writeable) {
+      Flags |= ELF::SHF_WRITE;
+    }
+    Section = OutContext.getELFSection(SectionName, ELF::SHT_PROGBITS, Flags);
+    break;
+  }
+  default:
+    return error("Unknown output format for target " + TripleName);
+    break;
+  }
+
+  if (attributes & CustomSectionAttributes_Executable) {
+    Section->setHasInstructions(true);
+    OutContext.addGenDwarfSection(Section);
+  }
+
+  OW->CustomSections[SectionNameStr] = Section;
+  return true;
+}
+
 extern "C" void SwitchSection(ObjectWriter *OW, const char *SectionName) {
   assert(OW && "ObjWriter is null");
   auto *AsmPrinter = &OW->getAsmPrinter();
@@ -253,16 +348,34 @@ extern "C" void SwitchSection(ObjectWriter *OW, const char *SectionName) {
   MCSection *Section = nullptr;
   if (strcmp(SectionName, "text") == 0) {
     Section = MOFI->getTextSection();
+    if (!Section->hasInstructions()) {
+      Section->setHasInstructions(true);
+      OutContext.addGenDwarfSection(Section);
+    }
   } else if (strcmp(SectionName, "data") == 0) {
     Section = MOFI->getDataSection();
   } else if (strcmp(SectionName, "rdata") == 0) {
     Section = MOFI->getReadOnlySection();
+  } else if (strcmp(SectionName, "xdata") == 0) {
+    Section = MOFI->getXDataSection();
   } else {
-    // Add more general cases
-    assert(!"Unsupported section");
+    std::string SectionNameStr(SectionName);
+    if (OW->CustomSections.find(SectionNameStr) != OW->CustomSections.end()) {
+      Section = OW->CustomSections[SectionNameStr];
+    } else {
+      // Add more general cases
+      assert(!"Unsupported section");
+    }
   }
 
+  OW->Sections.insert(Section);
   OST.SwitchSection(Section);
+
+  if (!Section->getBeginSymbol()) {
+    MCSymbol *SectionStartSym = OutContext.createTempSymbol();
+    OST.EmitLabel(SectionStartSym);
+    Section->setBeginSymbol(SectionStartSym);
+  }
 }
 
 extern "C" void EmitAlignment(ObjectWriter *OW, int ByteAlignment) {
@@ -315,30 +428,52 @@ GetSymbolRefExpr(ObjectWriter *OW, const char *SymbolName,
   return MCSymbolRefExpr::create(T, Kind, OutContext);
 }
 
-extern "C" void EmitSymbolRef(ObjectWriter *OW, const char *SymbolName,
-                              int Size, bool IsPCRelative, int Delta = 0) {
+enum class RelocType {
+  IMAGE_REL_BASED_ABSOLUTE = 0x00,
+  IMAGE_REL_BASED_HIGHLOW = 0x03,
+  IMAGE_REL_BASED_DIR64 = 0x0A,
+  IMAGE_REL_BASED_REL32 = 0x10,
+};
+
+extern "C" int EmitSymbolRef(ObjectWriter *OW, const char *SymbolName,
+                             RelocType RelocType, int Delta) {
   assert(OW && "ObjWriter is null");
   auto *AsmPrinter = &OW->getAsmPrinter();
   auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
   MCContext &OutContext = OST.getContext();
 
-  // Get symbol reference expression
-  const MCExpr *TargetExpr = GetSymbolRefExpr(OW, SymbolName);
+  bool IsPCRelative = false;
+  int Size = 0;
+  MCSymbolRefExpr::VariantKind Kind = MCSymbolRefExpr::VK_None;
 
-  switch (Size) {
-  case 8:
-    assert(!IsPCRelative && "NYI no support for 8 byte pc-relative");
+  // Convert RelocType to MCSymbolRefExpr
+  switch (RelocType) {
+  case RelocType::IMAGE_REL_BASED_ABSOLUTE:
+    assert(OW->MOFI->getObjectFileType() == OW->MOFI->IsCOFF);
+    Kind = MCSymbolRefExpr::VK_COFF_IMGREL32;
+    Size = 4;
     break;
-  case 4:
-    // If the fixup is pc-relative, we need to bias the value to be relative to
-    // the start of the field, not the end of the field
-    if (IsPCRelative) {
-      TargetExpr = MCBinaryExpr::createSub(
-          TargetExpr, MCConstantExpr::create(Size, OutContext), OutContext);
-    }
+  case RelocType::IMAGE_REL_BASED_HIGHLOW:
+    Size = 4;
+    break;
+  case RelocType::IMAGE_REL_BASED_DIR64:
+    Size = 8;
+    break;
+  case RelocType::IMAGE_REL_BASED_REL32:
+    Size = 4;
+    IsPCRelative = true;
     break;
   default:
-    assert(false && "NYI symbol reference size!");
+    assert(false && "NYI RelocType!");
+  }
+
+  const MCExpr *TargetExpr = GetSymbolRefExpr(OW, SymbolName, Kind);
+
+  if (IsPCRelative) {
+    // If the fixup is pc-relative, we need to bias the value to be relative to
+    // the start of the field, not the end of the field
+    TargetExpr = MCBinaryExpr::createSub(
+        TargetExpr, MCConstantExpr::create(Size, OutContext), OutContext);
   }
 
   if (Delta != 0) {
@@ -347,44 +482,23 @@ extern "C" void EmitSymbolRef(ObjectWriter *OW, const char *SymbolName,
   }
 
   OST.EmitValue(TargetExpr, Size, SMLoc(), IsPCRelative);
+
+  return Size;
 }
 
-extern "C" void EmitFrameInfo(ObjectWriter *OW, const char *FunctionName,
-                              int StartOffset, int EndOffset, int BlobSize,
-                              const char *BlobData) {
-
+extern "C" void EmitWinFrameInfo(ObjectWriter *OW, const char *FunctionName,
+                                 int StartOffset, int EndOffset,
+                                 const char *BlobSymbolName) {
   assert(OW && "ObjWriter is null");
   auto *AsmPrinter = &OW->getAsmPrinter();
   auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
   MCContext &OutContext = OST.getContext();
   const MCObjectFileInfo *MOFI = OutContext.getObjectFileInfo();
 
-  // Windows specific frame info for pdata/xdata.
-  // TODO: Should convert this for non-Windows.
-  if (MOFI->getObjectFileType() != MOFI->IsCOFF) {
-    return;
-  }
-
-  // .xdata emission
-  MCSection *Section = MOFI->getXDataSection();
-  OST.SwitchSection(Section);
-  OST.EmitValueToAlignment(4);
-
-  MCSymbol *FrameSymbol = OutContext.createTempSymbol();
-  OST.EmitLabel(FrameSymbol);
-
-  EmitBlob(OW, BlobSize, BlobData);
-
-  // Emit personality function symbol
-  // TODO: We now fake runtime as if it were C++ code.
-  // Need to clean up when EH plan is concrete.
-  OST.EmitValueToAlignment(4);
-  const MCExpr *PersonalityFn = GetSymbolRefExpr(
-      OW, "__CxxFrameHandler3", MCSymbolRefExpr::VK_COFF_IMGREL32);
-  OST.EmitValue(PersonalityFn, 4);
+  assert(MOFI->getObjectFileType() == MOFI->IsCOFF);
 
   // .pdata emission
-  Section = MOFI->getPDataSection();
+  MCSection *Section = MOFI->getPDataSection();
   OST.SwitchSection(Section);
   OST.EmitValueToAlignment(4);
 
@@ -400,9 +514,71 @@ extern "C" void EmitFrameInfo(ObjectWriter *OW, const char *FunctionName,
   OST.EmitValue(MCBinaryExpr::createAdd(BaseRefRel, EndOfs, OutContext), 4);
 
   // frame symbol reference
-  OST.EmitValue(MCSymbolRefExpr::create(
-                    FrameSymbol, MCSymbolRefExpr::VK_COFF_IMGREL32, OutContext),
-                4);
+  OST.EmitValue(
+      GetSymbolRefExpr(OW, BlobSymbolName, MCSymbolRefExpr::VK_COFF_IMGREL32),
+      4);
+}
+
+extern "C" void EmitCFIStart(ObjectWriter *OW, int Offset) {
+  assert(OW && "ObjWriter is null");
+  assert(!OW->FrameOpened && "frame should be closed before CFIStart");
+  auto *AsmPrinter = &OW->getAsmPrinter();
+  auto &OST = *AsmPrinter->OutStreamer;
+
+  OST.EmitCFIStartProc(false);
+  OW->FrameOpened = true;
+}
+
+extern "C" void EmitCFIEnd(ObjectWriter *OW, int Offset) {
+  assert(OW && "ObjWriter is null");
+  assert(OW->FrameOpened && "frame should be opened before CFIEnd");
+  auto *AsmPrinter = &OW->getAsmPrinter();
+  auto &OST = *AsmPrinter->OutStreamer;
+
+  OST.EmitCFIEndProc();
+  OW->FrameOpened = false;
+}
+
+extern "C" void EmitCFILsda(ObjectWriter *OW,  const char *LsdaBlobSymbolName) {
+  assert(OW && "ObjWriter is null");
+  assert(OW->FrameOpened && "frame should be opened before CFILsda");
+  auto *AsmPrinter = &OW->getAsmPrinter();
+  auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
+  MCContext &OutContext = OST.getContext();
+
+  // Create symbol reference
+  MCSymbol *T = OutContext.getOrCreateSymbol(LsdaBlobSymbolName);
+  MCAssembler &MCAsm = OST.getAssembler();
+  MCAsm.registerSymbol(*T);
+  OST.EmitCFILsda(T, llvm::dwarf::Constants::DW_EH_PE_pcrel |
+                         llvm::dwarf::Constants::DW_EH_PE_sdata4);
+}
+
+extern "C" void EmitCFICode(ObjectWriter *OW, int Offset, const char *Blob) {
+  assert(OW && "ObjWriter is null");
+  assert(OW->FrameOpened && "frame should be opened before CFICode");
+  auto *AsmPrinter = &OW->getAsmPrinter();
+  auto &OST = *AsmPrinter->OutStreamer;
+
+  CFI_CODE *CfiCode = (CFI_CODE *)Blob;
+  switch (CfiCode->CfiOpCode) {
+  case CFI_ADJUST_CFA_OFFSET:
+    assert(CfiCode->DwarfReg == DWARF_REG_ILLEGAL &&
+           "Unexpected Register Value for OpAdjustCfaOffset");
+    OST.EmitCFIAdjustCfaOffset(CfiCode->Offset);
+    break;
+  case CFI_REL_OFFSET:
+    OST.EmitCFIRelOffset(CfiCode->DwarfReg, CfiCode->Offset);
+    break;
+  case CFI_DEF_CFA_REGISTER:
+    assert(CfiCode->Offset == 0 &&
+           "Unexpected Offset Value for OpDefCfaRegister");
+    OST.EmitCFIDefCfaRegister(CfiCode->DwarfReg);
+    break;
+  default:
+    assert(!"Unrecognized CFI");
+    break;
+  }
 }
 
 static void EmitLabelDiff(MCStreamer &Streamer, const MCSymbol *From,
@@ -416,191 +592,231 @@ static void EmitLabelDiff(MCStreamer &Streamer, const MCSymbol *From,
   Streamer.EmitValue(AddrDelta, Size);
 }
 
-extern "C" void EmitDebugFileInfo(ObjectWriter *OW, int FileInfoSize,
-                                  const char *FileInfos[]) {
+extern "C" void EmitDebugFileInfo(ObjectWriter *OW, int FileId,
+                                  const char *FileName) {
   assert(OW && "ObjWriter is null");
   auto *AsmPrinter = &OW->getAsmPrinter();
   auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
   MCContext &OutContext = OST.getContext();
   const MCObjectFileInfo *MOFI = OutContext.getObjectFileInfo();
 
-  // TODO: Should convert this for non-Windows.
-  if (MOFI->getObjectFileType() != MOFI->IsCOFF) {
-    return;
+  assert(FileId > 0 && "FileId should be greater than 0.");
+  if (MOFI->getObjectFileType() == MOFI->IsCOFF) {
+    OST.EmitCVFileDirective(FileId, FileName);
+  } else {
+    OST.EmitDwarfFileDirective(FileId, "", FileName);
   }
-
-  MCSection *Section = MOFI->getCOFFDebugSymbolsSection();
-  OST.SwitchSection(Section);
-  OST.EmitIntValue(COFF::DEBUG_SECTION_MAGIC, 4);
-
-  // This subsection holds a file index to offset in string table table.
-  OST.EmitIntValue(COFF::DEBUG_INDEX_SUBSECTION, 4);
-  OST.EmitIntValue(8 * FileInfoSize, 4);
-  int CurrentOffset = 1;
-  for (int I = 0; I < FileInfoSize; I++) {
-    StringRef Filename = FileInfos[I];
-    // For each unique filename, just write its offset in the string table.
-    OST.EmitIntValue(CurrentOffset, 4);
-    // The function name offset is not followed by any additional data.
-    OST.EmitIntValue(0, 4);
-
-    CurrentOffset += Filename.size() + 1;
-  }
-
-  // This subsection holds the string table.
-  OST.EmitIntValue(COFF::DEBUG_STRING_TABLE_SUBSECTION, 4);
-  OST.EmitIntValue(CurrentOffset, 4);
-  // The payload starts with a null character.
-  OST.EmitIntValue(0, 1);
-
-  for (int I = 0; I < FileInfoSize; I++) {
-    // Just emit unique filenames one by one, separated by a null character.
-    OST.EmitBytes(FileInfos[I]);
-    OST.EmitIntValue(0, 1);
-  }
-
-  // No more subsections. Fill with zeros to align the end of the section by 4.
-  OST.EmitValueToAlignment(4);
 }
 
-static void EmitDebugLocInfo(ObjectWriter *OW, const char *FunctionName,
-                             int FunctionSize, int NumLocInfos,
-                             DebugLocInfo LocInfos[]) {
+static void EmitSymRecord(MCObjectStreamer &OST, int Size,
+                          SymbolRecordKind SymbolKind) {
+  SymRecord Rec = {ulittle16_t(Size + sizeof(ulittle16_t)),
+                   ulittle16_t(SymbolKind)};
+  OST.EmitBytes(StringRef((char *)&Rec, sizeof(Rec)));
+}
 
+static void EmitVarDefRange(MCObjectStreamer &OST, const MCSymbol *Fn,
+                            LocalVariableAddrRange &Range) {
+  const MCSymbolRefExpr *BaseSym =
+      MCSymbolRefExpr::create(Fn, OST.getContext());
+  const MCExpr *Offset =
+      MCConstantExpr::create(Range.OffsetStart, OST.getContext());
+  const MCExpr *Expr =
+      MCBinaryExpr::createAdd(BaseSym, Offset, OST.getContext());
+  OST.EmitCOFFSecRel32Value(Expr);
+  OST.EmitCOFFSectionIndex(Fn);
+  OST.EmitIntValue(Range.Range, 2);
+}
+
+static void EmitCVDebugVarInfo(MCObjectStreamer &OST, const MCSymbol *Fn,
+                               DebugVarInfo LocInfos[], int NumVarInfos) {
+  for (int I = 0; I < NumVarInfos; I++) {
+    // Emit an S_LOCAL record
+    DebugVarInfo Var = LocInfos[I];
+    LocalSym Sym = {};
+
+    int SizeofSym = sizeof(LocalSym);
+    EmitSymRecord(OST, SizeofSym + Var.Name.length() + 1,
+                  SymbolRecordKind::S_LOCAL);
+
+    Sym.Type = TypeIndex(Var.TypeIndex);
+
+    if (Var.IsParam) {
+      Sym.Flags |= LocalSym::IsParameter;
+    }
+
+    OST.EmitBytes(StringRef((char *)&Sym, SizeofSym));
+    OST.EmitBytes(StringRef(Var.Name.c_str(), Var.Name.length() + 1));
+
+    for (const auto &Range : Var.Ranges) {
+      // Emit a range record
+      switch (Range.loc.vlType) {
+      case ICorDebugInfo::VLT_REG:
+      case ICorDebugInfo::VLT_REG_FP: {
+        DefRangeRegisterSym Rec = {};
+        Rec.Range.OffsetStart = Range.startOffset;
+        Rec.Range.Range = Range.endOffset - Range.startOffset;
+        Rec.Range.ISectStart = 0;
+
+        // Currently only support integer registers.
+        // TODO: support xmm registers
+        if (Range.loc.vlReg.vlrReg >=
+            sizeof(cvRegMapAmd64) / sizeof(cvRegMapAmd64[0])) {
+          break;
+        }
+
+        Rec.Register = cvRegMapAmd64[Range.loc.vlReg.vlrReg];
+        EmitSymRecord(OST, sizeof(DefRangeRegisterSym),
+                      SymbolRecordKind::S_DEFRANGE_REGISTER);
+        OST.EmitBytes(
+            StringRef((char *)&Rec, offsetof(DefRangeRegisterSym, Range)));
+        EmitVarDefRange(OST, Fn, Rec.Range);
+        break;
+      }
+
+      case ICorDebugInfo::VLT_STK: {
+        DefRangeRegisterRelSym Rec = {};
+        Rec.Range.OffsetStart = Range.startOffset;
+        Rec.Range.Range = Range.endOffset - Range.startOffset;
+        Rec.Range.ISectStart = 0;
+
+        // TODO: support REGNUM_AMBIENT_SP
+        if (Range.loc.vlStk.vlsBaseReg >=
+            sizeof(cvRegMapAmd64) / sizeof(cvRegMapAmd64[0])) {
+          break;
+        }
+
+        assert(Range.loc.vlStk.vlsBaseReg <
+                   sizeof(cvRegMapAmd64) / sizeof(cvRegMapAmd64[0]) &&
+               "Register number should be in the range of [REGNUM_RAX, "
+               "REGNUM_R15].");
+        Rec.BaseRegister = cvRegMapAmd64[Range.loc.vlStk.vlsBaseReg];
+        Rec.BasePointerOffset = Range.loc.vlStk.vlsOffset;
+        EmitSymRecord(OST, sizeof(DefRangeRegisterRelSym),
+                      SymbolRecordKind::S_DEFRANGE_REGISTER_REL);
+        OST.EmitBytes(
+            StringRef((char *)&Rec, offsetof(DefRangeRegisterRelSym, Range)));
+        EmitVarDefRange(OST, Fn, Rec.Range);
+        break;
+      }
+
+      case ICorDebugInfo::VLT_REG_BYREF:
+      case ICorDebugInfo::VLT_STK_BYREF:
+      case ICorDebugInfo::VLT_REG_REG:
+      case ICorDebugInfo::VLT_REG_STK:
+      case ICorDebugInfo::VLT_STK_REG:
+      case ICorDebugInfo::VLT_STK2:
+      case ICorDebugInfo::VLT_FPSTK:
+      case ICorDebugInfo::VLT_FIXED_VA:
+        // TODO: for optimized debugging
+        break;
+
+      default:
+        assert(!"Unknown varloc type!");
+        break;
+      }
+    }
+  }
+}
+
+static void EmitCVDebugFunctionInfo(ObjectWriter *OW, const char *FunctionName,
+                                    int FunctionSize) {
   assert(OW && "ObjWriter is null");
   auto *AsmPrinter = &OW->getAsmPrinter();
   auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
   MCContext &OutContext = OST.getContext();
   const MCObjectFileInfo *MOFI = OutContext.getObjectFileInfo();
+  assert(MOFI->getObjectFileType() == MOFI->IsCOFF);
 
-  // TODO: Should convert this for non-Windows.
-  if (MOFI->getObjectFileType() != MOFI->IsCOFF) {
-    return;
-  }
+  // Mark the end of function.
+  MCSymbol *FnEnd = OutContext.createTempSymbol();
+  OST.EmitLabel(FnEnd);
 
   MCSection *Section = MOFI->getCOFFDebugSymbolsSection();
   OST.SwitchSection(Section);
+  // Emit debug section magic before the first entry.
+  if (OW->FuncId == 1) {
+    OST.EmitIntValue(COFF::DEBUG_SECTION_MAGIC, 4);
+  }
 
   MCSymbol *Fn = OutContext.getOrCreateSymbol(Twine(FunctionName));
 
   // Emit a symbol subsection, required by VS2012+ to find function boundaries.
   MCSymbol *SymbolsBegin = OutContext.createTempSymbol(),
            *SymbolsEnd = OutContext.createTempSymbol();
-  OST.EmitIntValue(COFF::DEBUG_SYMBOL_SUBSECTION, 4);
+  OST.EmitIntValue(unsigned(ModuleSubstreamKind::Symbols), 4);
   EmitLabelDiff(OST, SymbolsBegin, SymbolsEnd);
   OST.EmitLabel(SymbolsBegin);
   {
-    MCSymbol *ProcSegmentBegin = OutContext.createTempSymbol(),
-             *ProcSegmentEnd = OutContext.createTempSymbol();
-    EmitLabelDiff(OST, ProcSegmentBegin, ProcSegmentEnd, 2);
-    OST.EmitLabel(ProcSegmentBegin);
+    int RecSize = sizeof(ProcSym) + strlen(FunctionName) + 1;
+    EmitSymRecord(OST, RecSize, SymbolRecordKind::S_GPROC32_ID);
 
-    OST.EmitIntValue(COFF::DEBUG_SYMBOL_TYPE_PROC_START, 2);
-    // Some bytes of this segment don't seem to be required for basic debugging,
-    // so just fill them with zeroes.
-    OST.EmitFill(12, 0);
-    // This is the important bit that tells the debugger where the function
-    // code is located and what's its size:
-    OST.EmitIntValue(FunctionSize, 4);
-    OST.EmitFill(12, 0);
+    ProcSym ProRec = {};
+    ProRec.CodeSize = FunctionSize;
+    ProRec.DbgEnd = FunctionSize;
+
+    OST.EmitBytes(StringRef((char *)&ProRec, offsetof(ProcSym, CodeOffset)));
+
+    // Emit relocation
     OST.EmitCOFFSecRel32(Fn);
     OST.EmitCOFFSectionIndex(Fn);
-    OST.EmitIntValue(0, 1);
+
+    // Emit flags
+    OST.EmitIntValue(ProRec.Flags, sizeof(ProRec.Flags));
+
     // Emit the function display name as a null-terminated string.
-    OST.EmitBytes(FunctionName);
-    OST.EmitIntValue(0, 1);
-    OST.EmitLabel(ProcSegmentEnd);
+    OST.EmitBytes(StringRef(FunctionName, strlen(FunctionName) + 1));
+
+    // Emit local var info
+    int NumVarInfos = OW->DebugVarInfos.size();
+    if (NumVarInfos > 0) {
+      EmitCVDebugVarInfo(OST, Fn, &OW->DebugVarInfos[0], NumVarInfos);
+      OW->DebugVarInfos.clear();
+    }
 
     // We're done with this function.
-    OST.EmitIntValue(0x0002, 2);
-    OST.EmitIntValue(COFF::DEBUG_SYMBOL_TYPE_PROC_END, 2);
+    EmitSymRecord(OST, 0, SymbolRecordKind::S_PROC_ID_END);
   }
+
   OST.EmitLabel(SymbolsEnd);
 
   // Every subsection must be aligned to a 4-byte boundary.
   OST.EmitValueToAlignment(4);
 
-  // PCs/Instructions are grouped into segments sharing the same filename.
-  // Pre-calculate the lengths (in instructions) of these segments and store
-  // them in a map for convenience.  Each index in the map is the sequential
-  // number of the respective instruction that starts a new segment.
-  DenseMap<size_t, size_t> FilenameSegmentLengths;
-  size_t LastSegmentEnd = 0;
-  int PrevFileId = LocInfos[0].FileId;
-  for (int J = 1; J < NumLocInfos; ++J) {
-    if (PrevFileId == LocInfos[J].FileId)
-      continue;
-    FilenameSegmentLengths[LastSegmentEnd] = J - LastSegmentEnd;
-    LastSegmentEnd = J;
-    PrevFileId = LocInfos[J].FileId;
+  // We have an assembler directive that takes care of the whole line table.
+  // We also increase function id for the next function.
+  OST.EmitCVLinetableDirective(OW->FuncId++, Fn, FnEnd);
+}
+
+extern "C" void EmitDebugFunctionInfo(ObjectWriter *OW,
+                                      const char *FunctionName,
+                                      int FunctionSize) {
+  assert(OW && "ObjWriter is null");
+  auto *AsmPrinter = &OW->getAsmPrinter();
+  auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
+  MCContext &OutContext = OST.getContext();
+  const MCObjectFileInfo *MOFI = OutContext.getObjectFileInfo();
+
+  if (MOFI->getObjectFileType() == MOFI->IsCOFF) {
+    EmitCVDebugFunctionInfo(OW, FunctionName, FunctionSize);
+  } else {
+    // TODO: Should convert this for non-Windows.
   }
-  FilenameSegmentLengths[LastSegmentEnd] = NumLocInfos - LastSegmentEnd;
+}
 
-  // Emit a line table subsection, required to do PC-to-file:line lookup.
-  OST.EmitIntValue(COFF::DEBUG_LINE_TABLE_SUBSECTION, 4);
-  MCSymbol *LineTableBegin = OutContext.createTempSymbol(),
-           *LineTableEnd = OutContext.createTempSymbol();
-  EmitLabelDiff(OST, LineTableBegin, LineTableEnd);
-  OST.EmitLabel(LineTableBegin);
+extern "C" void EmitDebugVar(ObjectWriter *OW, char *Name, int TypeIndex,
+                             bool IsParm, int RangeCount,
+                             ICorDebugInfo::NativeVarInfo *Ranges) {
+  assert(OW && "ObjWriter is null");
+  assert(RangeCount != 0);
+  DebugVarInfo NewVar(Name, TypeIndex, IsParm);
 
-  // Identify the function this subsection is for.
-  OST.EmitCOFFSecRel32(Fn);
-  OST.EmitCOFFSectionIndex(Fn);
-  // Insert flags after a 16-bit section index.
-  OST.EmitIntValue(COFF::DEBUG_LINE_TABLES_HAVE_COLUMN_RECORDS, 2);
-
-  // Length of the function's code, in bytes.
-  OST.EmitIntValue(FunctionSize, 4);
-
-  // PC-to-linenumber lookup table:
-  MCSymbol *FileSegmentEnd = nullptr;
-
-  // The start of the last segment:
-  size_t LastSegmentStart = 0;
-
-  auto FinishPreviousChunk = [&] {
-    if (!FileSegmentEnd)
-      return;
-    for (size_t ColSegI = LastSegmentStart,
-                ColSegEnd = ColSegI + FilenameSegmentLengths[LastSegmentStart];
-         ColSegI != ColSegEnd; ++ColSegI) {
-      unsigned ColumnNumber = LocInfos[ColSegI].ColNumber;
-      OST.EmitIntValue(ColumnNumber, 2); // Start column
-      OST.EmitIntValue(ColumnNumber, 2); // End column
-    }
-    OST.EmitLabel(FileSegmentEnd);
-  };
-
-  for (int J = 0; J < NumLocInfos; ++J) {
-    DebugLocInfo Loc = LocInfos[J];
-
-    if (FilenameSegmentLengths.count(J)) {
-      // We came to a beginning of a new filename segment.
-      FinishPreviousChunk();
-
-      MCSymbol *FileSegmentBegin = OutContext.createTempSymbol();
-      OST.EmitLabel(FileSegmentBegin);
-      // Each entry in string index table is 8 byte.
-      OST.EmitIntValue(8 * Loc.FileId, 4);
-
-      // Number of PC records in the lookup table.
-      size_t SegmentLength = FilenameSegmentLengths[J];
-      OST.EmitIntValue(SegmentLength, 4);
-
-      // Full size of the segment for this filename, including the prev two
-      // records.
-      FileSegmentEnd = OutContext.createTempSymbol();
-      EmitLabelDiff(OST, FileSegmentBegin, FileSegmentEnd);
-      LastSegmentStart = J;
-    }
-
-    // The first PC with the given linenumber and the linenumber itself.
-    OST.EmitIntValue(Loc.NativeOffset, 4);
-    OST.EmitIntValue(Loc.LineNumber, 4);
+  for (int I = 0; I < RangeCount; I++) {
+    assert(Ranges[0].varNumber == Ranges[I].varNumber);
+    NewVar.Ranges.push_back(Ranges[I]);
   }
 
-  FinishPreviousChunk();
-  OST.EmitLabel(LineTableEnd);
+  OW->DebugVarInfos.push_back(NewVar);
 }
 
 extern "C" void EmitDebugLoc(ObjectWriter *OW, int NativeOffset, int FileId,
@@ -611,38 +827,35 @@ extern "C" void EmitDebugLoc(ObjectWriter *OW, int NativeOffset, int FileId,
   MCContext &OutContext = OST.getContext();
   const MCObjectFileInfo *MOFI = OutContext.getObjectFileInfo();
 
-  // TODO: Should convert this for non-Windows.
-  if (MOFI->getObjectFileType() != MOFI->IsCOFF) {
-    return;
+  assert(FileId > 0 && "FileId should be greater than 0.");
+  if (MOFI->getObjectFileType() == MOFI->IsCOFF) {
+    OST.EmitCVLocDirective(OW->FuncId, FileId, LineNumber, ColNumber, false,
+                           true, "");
+  } else {
+    OST.EmitDwarfLocDirective(FileId, LineNumber, ColNumber, 1, 0, 0, "");
   }
-
-  // We just aggregate locs for CodeView emission.
-  DebugLocInfo Loc = {NativeOffset, FileId, LineNumber, ColNumber};
-  OW->DebugLocInfos.push_back(Loc);
 }
 
-extern "C" void FlushDebugLocs(ObjectWriter *OW, const char *FunctionName,
-                               int FunctionSize) {
+// This should be invoked at the end of module emission to finalize
+// debug module info.
+extern "C" void EmitDebugModuleInfo(ObjectWriter *OW) {
   assert(OW && "ObjWriter is null");
   auto *AsmPrinter = &OW->getAsmPrinter();
   auto &OST = static_cast<MCObjectStreamer &>(*AsmPrinter->OutStreamer);
   MCContext &OutContext = OST.getContext();
   const MCObjectFileInfo *MOFI = OutContext.getObjectFileInfo();
 
-  // TODO: Should convert this for non-Windows.
-  if (MOFI->getObjectFileType() != MOFI->IsCOFF) {
-    return;
+  // Ensure ending all sections.
+  for (auto Section : OW->Sections) {
+    OST.endSection(Section);
   }
 
-  int NumLocInfos = OW->DebugLocInfos.size();
-  if (NumLocInfos > 0) {
-    std::unique_ptr<DebugLocInfo[]> LocInfos(new DebugLocInfo[NumLocInfos]);
-    std::copy(OW->DebugLocInfos.begin(), OW->DebugLocInfos.end(),
-              LocInfos.get());
-
-    EmitDebugLocInfo(OW, FunctionName, FunctionSize, NumLocInfos,
-                     LocInfos.get());
-
-    OW->DebugLocInfos.clear();
+  if (MOFI->getObjectFileType() == MOFI->IsCOFF) {
+    MCSection *Section = MOFI->getCOFFDebugSymbolsSection();
+    OST.SwitchSection(Section);
+    OST.EmitCVFileChecksumsDirective();
+    OST.EmitCVStringTableDirective();
+  } else {
+    MCGenDwarfInfo::Emit(&OST);
   }
 }

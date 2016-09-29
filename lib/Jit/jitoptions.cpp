@@ -45,13 +45,14 @@ MethodSet JitOptions::CodeRangeMethodSet;
 template <typename UTF16CharT>
 char16_t *getStringConfigValue(ICorJitInfo *CorInfo, const UTF16CharT *Name) {
   static_assert(sizeof(UTF16CharT) == 2, "UTF16CharT is the wrong size!");
-  return (char16_t *)CorInfo->getStringConfigValue((const wchar_t *)Name);
+  return (char16_t *)LLILCJit::TheJitHost->getStringConfigValue(
+      (const wchar_t *)Name);
 }
 
 template <typename UTF16CharT>
 void freeStringConfigValue(ICorJitInfo *CorInfo, UTF16CharT *Value) {
   static_assert(sizeof(UTF16CharT) == 2, "UTF16CharT is the wrong size!");
-  return CorInfo->freeStringConfigValue((wchar_t *)Value);
+  return LLILCJit::TheJitHost->freeStringConfigValue((wchar_t *)Value);
 }
 
 JitOptions::JitOptions(LLILCJitContext &Context) {
@@ -63,7 +64,7 @@ JitOptions::JitOptions(LLILCJitContext &Context) {
 
   // Set optimization level for this JIT invocation.
   OptLevel = queryOptLevel(Context);
-  EnableOptimization = OptLevel != OptLevel::DEBUG_CODE;
+  EnableOptimization = OptLevel != ::OptLevel::DEBUG_CODE;
 
   // Set whether to use conservative GC.
   UseConservativeGC = queryUseConservativeGC(Context);
